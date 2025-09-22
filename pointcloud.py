@@ -1,293 +1,184 @@
-import math
-import os
-import argparse
+import cv2
 import numpy as np
 import open3d as o3d
+import os
+import realsenselib as rslib
 
-# ---------------------------- helpers ---------------------------------
+Cam = rslib.Cam_worker()  # width = 640, height = 480
+golden_path = "golden_sample.pcd"
 
-def print_cloud_stats(pcd: o3d.geometry.PointCloud, tag: str):
-    pts = np.asarray(pcd.points)
-    if pts.size == 0:
-        print(f"[Stats] {tag}: 0 points")
-        return
-    mins = pts.min(axis=0)
-    maxs = pts.max(axis=0)
-    meds = np.median(pts, axis=0)
-    print(f"[Stats] {tag}: N={len(pts)}  "
-          f"X:[{mins[0]:.4f},{maxs[0]:.4f}]  "
-          f"Y:[{mins[1]:.4f},{maxs[1]:.4f}]  "
-          f"Z:[{mins[2]:.4f},{maxs[2]:.4f}]  Z_med={meds[2]:.4f}")
 
-def ensure_normals(pcd: o3d.geometry.PointCloud, voxel: float):
-    if len(pcd.points) == 0:
-        return
-    if not pcd.has_normals():
-        radius = max(1e-3, voxel * 2.0)
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50)
-        )
-        # OK for relative alignment
-        pcd.orient_normals_towards_camera_location(np.array([0.0, 0.0, 0.0]))
+def draw_circle(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDBLCLK:
+        print("X: ", x, " , Y: ", y)
+        print("depth: ", depth_image[y, x])
 
-def ensure_proper_rotation(R: np.ndarray) -> np.ndarray:
-    U, _, Vt = np.linalg.svd(R)
-    R_proj = U @ Vt
-    if np.linalg.det(R_proj) < 0:
-        Vt[-1, :] *= -1
-        R_proj = U @ Vt
-    return R_proj
 
-def rotmat_to_axis_angle(R: np.ndarray):
-    R = ensure_proper_rotation(R)
-    tr = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
-    theta = math.acos(tr)
-    if abs(theta) < 1e-12:
-        return np.array([1.0, 0.0, 0.0]), 0.0
-    axis = np.array([
-        R[2, 1] - R[1, 2],
-        R[0, 2] - R[2, 0],
-        R[1, 0] - R[0, 1],
-    ]) / (2.0 * math.sin(theta))
-    axis = axis / (np.linalg.norm(axis) + 1e-12)
-    return axis, theta
+def rs_to_pointcloud(color, depth, intrin):
+    h, w = depth.shape
+    fx, fy = intrin.fx, intrin.fy
+    cx, cy = intrin.ppx, intrin.ppy
+    depth_scale = 0.001  # 將 depth 單位從 mm 轉為 m
 
-def rotmat_to_ypr_zyx(R: np.ndarray):
-    """Intrinsic ZYX: returns yaw(Z), pitch(Y), roll(X) in radians."""
-    R = ensure_proper_rotation(R)
-    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
-    if sy >= 1e-8:
-        yaw   = math.atan2(R[1, 0], R[0, 0])
-        pitch = math.atan2(-R[2, 0], sy)
-        roll  = math.atan2(R[2, 1], R[2, 2])
+    # 生成像素座標網格
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+    z = depth.astype(np.float32) * depth_scale
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+
+    # 建立點雲與對應顏色
+    points = np.stack((x, y, z), axis=-1).reshape(-1, 3)
+    colors = color.reshape(-1, 3).astype(np.float32) / 255.0
+
+    # 過濾：z > 0 且 z < 1.2 公尺
+    z_flat = z.reshape(-1)
+    valid = (z_flat > 0) & (z_flat < 1.2)
+    points = points[valid]
+    colors = colors[valid]
+
+    # 建立 Open3D PointCloud 物件
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    return pcd
+
+
+def visualize_pcds(pcd1, pcd2=None):
+    try:
+        if pcd2:
+            pcd1.paint_uniform_color([0, 1, 0])  # Green: golden
+            pcd2.paint_uniform_color([1, 0, 0])  # Red: current
+            o3d.visualization.draw_geometries([pcd1, pcd2])
+        else:
+            o3d.visualization.draw_geometries([pcd1])
+    except Exception as e:
+        print("[Open3D] 視窗建立失敗（可能沒有 OpenGL/顯示環境）。略過 3D 顯示。", e)
+
+
+def compare_pcd_distance(pcd1, pcd2):
+    # 使用 open3d 距離計算
+    dists = pcd1.compute_point_cloud_distance(pcd2)
+    if len(dists) == 0:
+        return float('inf')
+    return float(np.mean(dists))
+
+def icp(source_pcd, target_pcd, max_corr=0.02, max_iter=50):
+    """
+    用 Open3D 做最基本的 ICP 配準（source -> target）
+    回傳: T(4x4), fitness, rmse
+    """
+    result = o3d.pipelines.registration.registration_icp(
+        source=source_pcd, target=target_pcd,
+        max_correspondence_distance=max_corr,
+        init=np.eye(4),
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
+    )
+    return result.transformation, float(result.fitness), float(result.inlier_rmse)
+
+def transform_to_readable(T):
+    """
+    T: 4x4 變換矩陣
+    回傳: (yaw_deg, pitch_deg, roll_deg, t_mm_xyz)
+    ZYX (yaw-pitch-roll)
+    """
+    R = T[:3, :3]
+    t = T[:3, 3]
+
+    # ZYX: R = Rz * Ry * Rx
+    # pitch = -asin(R[2,0]); roll = atan2(R[2,1], R[2,2]); yaw = atan2(R[1,0], R[0,0])
+    # 處理數值誤差
+    r20 = np.clip(R[2, 0], -1.0, 1.0)
+    pitch = -np.arcsin(r20)
+
+    # 檢查接近萬向節鎖（gimbal lock）
+    if np.isclose(abs(r20), 1.0, atol=1e-8):
+        # pitch ~ ±90°，此時 roll 設 0，yaw 從另一元素取得
+        roll = 0.0
+        yaw = np.arctan2(-R[0, 1], R[1, 1])
     else:
-        yaw   = math.atan2(-R[0, 1], R[1, 1])
-        pitch = math.atan2(-R[2, 0], sy)
-        roll  = 0.0
-    return yaw, pitch, roll
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw = np.arctan2(R[1, 0], R[0, 0])
 
-# ----------------------------- class ----------------------------------
+    yaw_deg = float(np.degrees(yaw))
+    pitch_deg = float(np.degrees(pitch))
+    roll_deg = float(np.degrees(roll))
 
-class ICPFITTER:
-    def __init__(self,
-                 src_path=None,
-                 tgt_path=None,
-                 use_icp=True,
-                 default_region="source"):
-        """
-        src_path: 你的 SOURCE 點雲
-        tgt_path: 你的 TARGET 點雲
-        default_region: 預設使用 'source' 或 'target'
-        """
+    t_mm = (float(t[0] * 1000.0), float(t[1] * 1000.0), float(t[2] * 1000.0))
+    return yaw_deg, pitch_deg, roll_deg, t_mm
 
-        
-        if src_path is None:
-            src_path = os.path.abspath(
-                os.path.join(os.getcwd(), "golden", "3D_golden.ply")
-            )
-        if tgt_path is None:
-            tgt_path = os.path.abspath(
-                os.path.join(os.getcwd(), "golden(yaw+1)", "3D_golden(yaw+1).ply")
-            )
+golden_pcd = None
 
-        # 統一的路徑表（新 key）
-        self.paths = {
-            "source": src_path,   # 你的基準（正視）
-            "target": tgt_path,   # 你的旋轉後
-        }
+while True:
+    color_image, depth_image = Cam.take_pic()
+    cv2.namedWindow('RealSense - Pose Detection', cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback('RealSense - Pose Detection', draw_circle)
+    cv2.imshow('RealSense - Pose Detection', color_image)
 
-        self.use_icp = use_icp
-        self.default_region = default_region
+    #print("🔍 拍攝並與 golden sample 比對")
+    current_pcd = rs_to_pointcloud(color_image, depth_image, Cam.depth_intrin)
 
-        # 防呆：檔案不存在就拋錯，早點發現路徑問題
-        for name, p in {"source": src_path, "target": tgt_path}.items():
-            if not os.path.isfile(p):
-                raise FileNotFoundError(f"[ICPFITTER] {name} 檔案找不到：{p}")
-
-    # ----------------- new: compute ΔT from two files ------------------
-
-    def delta_T_from_files(self, source_path, target_path,
-                           voxel=0.003, icp_mode="point_to_plane",
-                           max_corr=None, print_stats=True):
-        """
-        Compute ΔT so that ΔT @ SOURCE ≈ TARGET.
-        Returns (T, info)
-        info: axis, angle_deg, yaw_deg, pitch_deg, roll_deg, t_cm, fitness, rmse_mm
-        """
-        src = o3d.io.read_point_cloud(source_path)
-        tgt = o3d.io.read_point_cloud(target_path)
-        if src.is_empty() or tgt.is_empty():
-            raise RuntimeError("讀入的點雲為空，請檢查路徑/檔案。")
-
-        if print_stats:
-            print_cloud_stats(src, "SRC(raw)")
-            print_cloud_stats(tgt, "TGT(raw)")
-
-        # Downsample
-        src_d = src.voxel_down_sample(voxel)
-        tgt_d = tgt.voxel_down_sample(voxel)
-
-        if icp_mode == "point_to_plane":
-            ensure_normals(src_d, voxel)
-            ensure_normals(tgt_d, voxel)
-            estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+    if golden_pcd is None:
+        if os.path.exists(golden_path):
+            golden_pcd = o3d.io.read_point_cloud(golden_path)
+            print("📂 從檔案載入 golden sample")
         else:
-            estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+            print("⚠️ 尚未建立 golden sample！請先按下 a 建立")
+            k = cv2.waitKey(1)
+            if k == -1:
+                continue
+            try:
+                key = chr(k)
+            except:
+                continue
+            if key in ['q', 'Q']:
+                print(Cam.depth_intrin)
+                break
+            elif key in ['a', 'A']:
+                print("📸 拍攝點雲並儲存為 golden sample")
+                pcd = rs_to_pointcloud(color_image, depth_image, Cam.depth_intrin)
+                visualize_pcds(pcd)
+                o3d.io.write_point_cloud(golden_path, pcd)
+                golden_pcd = pcd
+                print(f"✅ 儲存成功：{golden_path}")
+            continue
 
-        if max_corr is None:
-            max_corr = voxel * 8.0  # e.g., 3mm voxel -> 24mm
+    # 原本平均距離（未對齊）
+    dist = compare_pcd_distance(golden_pcd, current_pcd)
+    # print(f"📏 平均點雲距離: {dist:.4f} m")
 
-        init = np.eye(4)
-        reg = o3d.pipelines.registration.registration_icp(
-            src_d, tgt_d, max_corr, init, estimation,
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60)
-        )
+    # ======（新增）做 ICP，並把 T 轉成好讀格式 ======
+    T, fitness, rmse = icp(current_pcd, golden_pcd, max_corr=0.02, max_iter=50)
+    yaw_deg, pitch_deg, roll_deg, t_mm = transform_to_readable(T)
+    #print(f"🔧 ICP: fitness={fitness:.3f}, rmse={rmse*1000:.2f} mm")
+    np.set_printoptions(suppress=True, precision=6, floatmode='fixed')
+    #print("轉換矩陣:\n", T)
+    print(f"Euler ZYX (deg)  yaw={yaw_deg:+.4f}, pitch={pitch_deg:+.4f}, roll={roll_deg:+.4f}")
+    print(f"t (mm)           [{t_mm[0]:+.3f}, {t_mm[1]:+.3f}, {t_mm[2]:+.3f}]")
 
-        T = reg.transformation
-        R = T[:3, :3]
-        t = T[:3, 3]
+    k = cv2.waitKey(1)
+    if k == -1:
+        continue
 
-        axis, theta = rotmat_to_axis_angle(R)
-        yaw, pitch, roll = rotmat_to_ypr_zyx(R)
+    try:
+        key = chr(k)
+    except:
+        continue
 
-        info = {
-            "axis": axis.tolist(),
-            "angle_deg": math.degrees(theta),
-            "yaw_deg": math.degrees(yaw),
-            "pitch_deg": math.degrees(pitch),
-            "roll_deg": math.degrees(roll),
-            "t_cm": (t * 100.0).tolist(),
-            "fitness": reg.fitness,
-            "rmse_mm": reg.inlier_rmse * 1000.0,
-        }
-        return T, info
+    if key in ['q', 'Q']:
+        print(Cam.depth_intrin)
+        break
 
-    # ------------------ the rest (from your example) -------------------
+    elif key in ['a', 'A']:
+        print("📸 拍攝點雲並儲存為 golden sample")
+        pcd = rs_to_pointcloud(color_image, depth_image, Cam.depth_intrin)
+        visualize_pcds(pcd)
+        o3d.io.write_point_cloud(golden_path, pcd)
+        golden_pcd = pcd
+        print(f"✅ 儲存成功：{golden_path}")
 
-    def save_golden(self, color_image, depth_image, depth_intrin, region="screw"):
-        """用當下影像建立點雲並存成該區域的 golden 檔"""
-        pcd = self.rs_to_pointcloud(color_image, depth_image, depth_intrin)
-        if pcd is None or len(pcd.points) == 0:
-            print("⚠️ 無法從當前影像建立點雲，未儲存 golden")
-            return False
+    elif key in ['b', 'B']:
+        visualize_pcds(golden_pcd, current_pcd)
 
-        path = self._region_path(region)
-        ok = o3d.io.write_point_cloud(path, pcd)
-        if ok:
-            self.golden[region] = pcd
-            print(f"✅ 已儲存 {region} golden: {path} (點數={len(pcd.points)})")
-            return True
-        else:
-            print(f"❌ 儲存失敗: {path}")
-            return False
-
-    def icp_fit(self, color_image, depth_image, depth_intrin, region=None):
-        region = (region or self.default_region).lower()
-        g = self.golden.get(region, None)
-        if g is None:
-            print(f"⚠️ {region} golden 不存在，請先 save {region}")
-            return None
-
-        cur = self.rs_to_pointcloud(color_image, depth_image, depth_intrin)
-        if cur is None or len(cur.points) == 0:
-            print("⚠️ 無法建立當前點雲")
-            return None
-
-        # 下採樣與法線（穩定 ICP）
-        g_d = g.voxel_down_sample(0.003)
-        c_d = cur.voxel_down_sample(0.003)
-        ensure_normals(g_d, 0.003)
-        ensure_normals(c_d, 0.003)
-
-        if self.use_icp:
-            threshold = 0.05  # 5 cm
-            init = np.eye(4)
-            result = o3d.pipelines.registration.registration_icp(
-                c_d, g_d, threshold, init,
-                o3d.pipelines.registration.TransformationEstimationPointToPoint()
-            )
-            return float(result.inlier_rmse)
-        else:
-            d = np.mean(g_d.compute_point_cloud_distance(c_d))
-            return float(d)
-
-    # ---- internal tools ----
-
-    def _region_path(self, region):
-        region = region.lower()
-        if region not in self.paths:
-            raise ValueError(f"未知區域: {region}，應為 'screw' 或 'battery'")
-        return self.paths[region]
-
-    def rs_to_pointcloud(self, color, depth, intrin):
-        """
-        color: HxWx3 uint8 (BGR/RGB 皆可)
-        depth: HxW uint16 (深度 raw)
-        intrin: RealSense intrinsics 物件 (含 fx, fy, ppx, ppy)
-        """
-        if color is None or depth is None or intrin is None:
-            return None
-        h, w = depth.shape
-        fx, fy = intrin.fx, intrin.fy
-        cx, cy = intrin.ppx, intrin.ppy
-
-        depth_scale = 0.001  # D435 常見
-        u, v = np.meshgrid(np.arange(w), np.arange(h))
-        z = depth.astype(np.float32) * depth_scale
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-
-        points = np.stack((x, y, z), axis=-1).reshape(-1, 3)
-        colors = color.reshape(-1, 3).astype(np.float32) / 255.0
-
-        valid = (z.reshape(-1) > 0) & (z.reshape(-1) < 1.5)
-        points = points[valid]
-        colors = colors[valid]
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-        return pcd
-
-# ----------------------------- CLI ------------------------------------
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="Compute ΔT so that ΔT @ SOURCE ≈ TARGET (from two files)."
-    )
-    ap.add_argument("--source", default="golden/3D_golden.ply",
-                    help="SOURCE point cloud path (default: golden/3D_golden.ply)")
-    ap.add_argument("--target", default="golden(yaw+1)/3D_golden(yaw+1).ply",
-                    help="TARGET point cloud path (default: golden(yaw+1)/3D_golden(yaw+1).ply)")
-    ap.add_argument("--voxel", type=float, default=0.003,
-                    help="Voxel downsample size in meters (default: 0.003)")
-    ap.add_argument("--icp_mode", choices=["point_to_plane", "point_to_point"],
-                    default="point_to_plane", help="ICP metric (default: point_to_plane)")
-    ap.add_argument("--max_corr", type=float, default=None,
-                    help="Max correspondence distance in meters (default: 8*voxel)")
-    ap.add_argument("--no_stats", action="store_true", help="Do not print raw stats")
-    args = ap.parse_args()
-
-    fitter = ICPFITTER()
-    T, info = fitter.delta_T_from_files(
-        source_path=args.source,
-        target_path=args.target,
-        voxel=args.voxel,
-        icp_mode=args.icp_mode,
-        max_corr=args.max_corr,
-        print_stats=not args.no_stats,
-    )
-
-    np.set_printoptions(precision=6, suppress=True)
-    print("\n=== ΔT (SOURCE → TARGET) ===")
-    print(T)
-    print(f"\n主角度（axis-angle）≈ {info['angle_deg']:.6f}°")
-    print(f"軸  = {info['axis']}")
-    print(f"Euler ZYX (deg) = "
-          f"[yaw {info['yaw_deg']:.6f}, pitch {info['pitch_deg']:.6f}, roll {info['roll_deg']:.6f}]")
-    print(f"t   = {info['t_cm']} cm")
-    print(f"ICP: fitness={info['fitness']:.6f}, RMSE={info['rmse_mm']:.3f} mm")
-
-
-if __name__ == "__main__":
-    main()
+cv2.destroyAllWindows()
